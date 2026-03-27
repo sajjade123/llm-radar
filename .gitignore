@@ -18,3 +18,5 @@ env/
 *~
 .DS_Store
 Thumbs.db
+rankings_cache.json
+rankings.html

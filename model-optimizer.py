@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
 """
-OpenRouter Model Optimizer — Analyze and rank LLMs for different use cases.
-Pulls live data from OpenRouter API + rankings to score models across categories.
+llm-radar - Data-driven LLM ranking tool for OpenRouter.
 
-All scoring is based on verifiable API data: supported parameters, context length,
-pricing, modalities, and popularity. No subjective keyword matching.
+Analyze, compare, and rank 340+ models using real API data.
+No subjective scoring - every score based on verifiable capabilities.
 
 Usage:
-    python model-optimizer.py                    # Full analysis
-    python model-optimizer.py --active           # Only active models (last 6 months)
-    python model-optimizer.py --coding           # Best for coding
-    python model-optimizer.py --reasoning        # Best for reasoning
-    python model-optimizer.py --budget           # Best value (paid)
-    python model-optimizer.py --free             # Best free models
-    python model-optimizer.py --agents           # Best for tool use/agents
-    python model-optimizer.py --multimodal       # Best multimodal
-    python model-optimizer.py --context          # Largest context windows
-    python model-optimizer.py --compare MODEL1 MODEL2
-    python model-optimizer.py --show MODEL       # Detailed single model view
-    python model-optimizer.py --search QUERY     # Search models
-    python model-optimizer.py --top N            # Show top N per category
-    python model-optimizer.py --json             # Output as JSON
-    python model-optimizer.py --optimize-claude  # Best models for Claude Code
-    python model-optimizer.py --include-expired  # Include expired models
+    python model-optimizer.py                           # Full analysis
+    python model-optimizer.py --coding                  # Best for coding
+    python model-optimizer.py --free                    # Best free models
+    python model-optimizer.py --compare MODEL1 MODEL2   # Compare models
+    python model-optimizer.py --show MODEL              # Detailed view
+    python model-optimizer.py --search QUERY            # Search models
+    python model-optimizer.py --cost 10000 5000         # Cost for 10K in / 5K out tokens
+    python model-optimizer.py --provider anthropic      # Filter by provider
+    python model-optimizer.py --max-price 2.00          # Max $2/1M tokens
+    python model-optimizer.py --min-context 128000      # Min 128K context
+    python model-optimizer.py --has-tools               # Only models with tools
+    python model-optimizer.py --has-reasoning           # Only models with reasoning
+    python model-optimizer.py --csv --coding            # Export as CSV
+    python model-optimizer.py --markdown --coding       # Export as Markdown
+    python model-optimizer.py --json                    # Export as JSON
+    python model-optimizer.py --optimize-claude         # Best for Claude Code
+    python model-optimizer.py --update-rankings         # Fetch live rankings
 """
 
 import argparse
-import json
-import sys
-import re
+import csv
 import io
+import json
 import math
+import re
+import sys
 from datetime import datetime, timezone
 import requests
 
@@ -41,126 +42,207 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="repla
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 MODELS_API = "https://openrouter.ai/api/v1/models"
+RANKINGS_URL = "https://openrouter.ai/rankings"
+RANKINGS_CACHE = "rankings_cache.json"
 
-# Top rankings from openrouter.ai/rankings (updated 2026-03-27)
-# Used only as a lightweight tiebreaker (max 15% of score)
-RANKINGS = {
-    "xiaomi/mimo-v2-pro": {"rank": 1, "tokens": "3.28T", "growth": "+1,339%"},
-    "stepfun/step-3.5-flash:free": {"rank": 2, "tokens": "1.53T", "growth": "+10%"},
-    "deepseek/deepseek-v3.2": {"rank": 3, "tokens": "1.2T", "growth": "+8%"},
-    "minimax/minimax-m2.7": {"rank": 4, "tokens": "1.08T", "growth": "+1,968%"},
-    "minimax/minimax-m2.5": {"rank": 5, "tokens": "1.05T", "growth": "+29%"},
-    "z-ai/glm-5-turbo": {"rank": 6, "tokens": "1.03T", "growth": "+84%"},
-    "anthropic/claude-opus-4.6": {"rank": 7, "tokens": "1.02T", "growth": "+9%"},
-    "anthropic/claude-sonnet-4.6": {"rank": 8, "tokens": "1.01T", "growth": "+2%"},
-    "google/gemini-3-flash-preview": {"rank": 9, "tokens": "950B", "growth": "+4%"},
-    "google/gemini-2.5-flash-lite": {"rank": 10, "tokens": "553B", "growth": "+12%"},
+# Fallback rankings (used if live fetch fails)
+FALLBACK_RANKINGS = {
+    "xiaomi/mimo-v2-pro": {"rank": 1, "total_tokens": 3280000000000},
+    "stepfun/step-3.5-flash": {"rank": 2, "total_tokens": 1530000000000},
+    "deepseek/deepseek-v3.2": {"rank": 3, "total_tokens": 1200000000000},
+    "minimax/minimax-m2.7": {"rank": 4, "total_tokens": 1080000000000},
+    "minimax/minimax-m2.5": {"rank": 5, "total_tokens": 1050000000000},
+    "z-ai/glm-5-turbo": {"rank": 6, "total_tokens": 1030000000000},
+    "anthropic/claude-opus-4.6": {"rank": 7, "total_tokens": 1020000000000},
+    "anthropic/claude-sonnet-4.6": {"rank": 8, "total_tokens": 1010000000000},
+    "google/gemini-3-flash-preview": {"rank": 9, "total_tokens": 950000000000},
+    "google/gemini-2.5-flash-lite": {"rank": 10, "total_tokens": 553000000000},
 }
 
-# Scoring dimensions — each is 100% based on verifiable API data
-# Weights are displayed transparently so users can judge bias
-
-# Scoring weights per category (must sum to 1.0)
-CATEGORY_WEIGHTS = {
+# Category definitions with scoring weights
+CATEGORIES = {
     "coding": {
         "label": "Best for Coding",
-        "icon": "Code",
         "description": "Code generation, debugging, refactoring, technical writing",
         "weights": {"capability": 0.50, "context": 0.15, "pricing": 0.15, "popularity": 0.10, "speed": 0.10},
         "caps": {"tools": 40, "tool_choice": 20, "structured_outputs": 15, "reasoning": 15, "response_format": 10},
-        "exclude_free": False,
-        "only_free": False,
-        "require_multimodal": False,
+        "exclude_free": False, "only_free": False, "require_multimodal": False,
     },
     "reasoning": {
         "label": "Best for Reasoning",
-        "icon": "Brain",
         "description": "Complex analysis, math, logic, multi-step problem solving",
         "weights": {"capability": 0.55, "context": 0.20, "pricing": 0.10, "popularity": 0.10, "speed": 0.05},
         "caps": {"reasoning": 35, "include_reasoning": 25, "tools": 15, "structured_outputs": 10, "response_format": 10, "frequency_penalty": 5},
-        "exclude_free": False,
-        "only_free": False,
-        "require_multimodal": False,
+        "exclude_free": False, "only_free": False, "require_multimodal": False,
     },
     "budget": {
         "label": "Best Value (Paid)",
-        "icon": "Dollar",
         "description": "Best capability per dollar for paid models",
         "weights": {"capability": 0.25, "context": 0.10, "pricing": 0.35, "popularity": 0.20, "speed": 0.10},
         "caps": {"tools": 25, "reasoning": 20, "tool_choice": 15, "structured_outputs": 15, "response_format": 10, "seed": 5, "stop": 10},
-        "exclude_free": True,
-        "only_free": False,
-        "require_multimodal": False,
+        "exclude_free": True, "only_free": False, "require_multimodal": False,
     },
     "free": {
         "label": "Best Free Models",
-        "icon": "Free",
         "description": "Top free models ranked by capability",
         "weights": {"capability": 0.45, "context": 0.25, "pricing": 0.0, "popularity": 0.15, "speed": 0.15},
         "caps": {"tools": 30, "reasoning": 25, "tool_choice": 15, "structured_outputs": 15, "response_format": 10, "seed": 5},
-        "exclude_free": False,
-        "only_free": True,
-        "require_multimodal": False,
+        "exclude_free": False, "only_free": True, "require_multimodal": False,
     },
     "agents": {
         "label": "Best for Agents/Tool Use",
-        "icon": "Agent",
         "description": "Agentic workflows, tool calling, function execution",
         "weights": {"capability": 0.55, "context": 0.15, "pricing": 0.10, "popularity": 0.10, "speed": 0.10},
         "caps": {"tools": 35, "tool_choice": 25, "structured_outputs": 15, "reasoning": 15, "response_format": 10},
-        "exclude_free": False,
-        "only_free": False,
-        "require_multimodal": False,
+        "exclude_free": False, "only_free": False, "require_multimodal": False,
     },
     "multimodal": {
         "label": "Best Multimodal",
-        "icon": "Media",
         "description": "Image, video, audio understanding and generation",
         "weights": {"capability": 0.50, "context": 0.15, "pricing": 0.10, "popularity": 0.15, "speed": 0.10},
         "caps": {"image": 30, "video": 20, "audio": 20, "tools": 15, "reasoning": 10, "structured_outputs": 5},
-        "exclude_free": False,
-        "only_free": False,
-        "require_multimodal": True,
+        "exclude_free": False, "only_free": False, "require_multimodal": True,
     },
     "context": {
         "label": "Largest Context",
-        "icon": "Context",
         "description": "Models with the largest context windows",
         "weights": {"capability": 0.0, "context": 0.70, "pricing": 0.10, "popularity": 0.10, "speed": 0.10},
         "caps": {},
-        "exclude_free": False,
-        "only_free": False,
-        "require_multimodal": False,
+        "exclude_free": False, "only_free": False, "require_multimodal": False,
     },
 }
 
-# Claude Code optimization categories
 CLAUDE_CODE_ROLES = {
     "opus-class": {
         "label": "Opus-class (Complex Reasoning)",
-        "icon": "Trophy",
         "env_var": "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "needs": ["reasoning", "coding"],
     },
     "sonnet-class": {
         "label": "Sonnet-class (General Coding)",
-        "icon": "Zap",
         "env_var": "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "needs": ["coding", "agents"],
     },
     "haiku-class": {
         "label": "Haiku-class (Fast Completions)",
-        "icon": "Run",
         "env_var": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         "needs": ["coding", "free"],
     },
     "subagent": {
         "label": "Sub-agent Model",
-        "icon": "Link",
         "env_var": "CLAUDE_CODE_SUBAGENT_MODEL",
         "needs": ["agents", "coding"],
     },
 }
+
+
+# ─── Rankings Fetching ───────────────────────────────────────────────────────
+
+def fetch_live_rankings() -> dict:
+    """Fetch live rankings from OpenRouter rankings page."""
+    print("Fetching live rankings from OpenRouter...")
+    try:
+        resp = requests.get(RANKINGS_URL, timeout=30)
+        resp.raise_for_status()
+        html = resp.text
+
+        # Extract RSC payload containing rankingData
+        pushes = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL)
+
+        ranking_data = []
+        for p in pushes:
+            if 'rankingData' in p and 'model_permaslug' in p:
+                unescaped = p.replace('\\"', '"').replace('\\\\', '\\')
+                # Find the array bounds
+                arr_start = unescaped.find('"rankingData":[') + len('"rankingData":')
+                depth = 0
+                arr_end = arr_start
+                for ci, c in enumerate(unescaped[arr_start:]):
+                    if c == '[':
+                        depth += 1
+                    elif c == ']':
+                        depth -= 1
+                    if depth == 0:
+                        arr_end = arr_start + ci + 1
+                        break
+                try:
+                    ranking_data = json.loads(unescaped[arr_start:arr_end])
+                except json.JSONDecodeError:
+                    pass
+                break
+
+        if not ranking_data:
+            print("   Could not parse live rankings, using fallback")
+            return FALLBACK_RANKINGS
+
+        # Aggregate by base model ID (strip date suffixes)
+        models = {}
+        for entry in ranking_data:
+            slug = entry.get("model_permaslug", "")
+            if not slug:
+                continue
+            # Normalize: strip date suffix like -20260205
+            base_slug = re.sub(r'-\d{8}$', '', slug)
+            total_tokens = entry.get("total_prompt_tokens", 0) + entry.get("total_completion_tokens", 0)
+
+            if base_slug not in models:
+                models[base_slug] = {"total_tokens": 0, "requests": 0}
+            models[base_slug]["total_tokens"] += total_tokens
+            models[base_slug]["requests"] += entry.get("count", 0)
+
+        # Sort and rank
+        ranked_list = sorted(models.items(), key=lambda x: x[1]["total_tokens"], reverse=True)
+        rankings = {}
+        for i, (slug, data) in enumerate(ranked_list[:100], 1):
+            rankings[slug] = {
+                "rank": i,
+                "total_tokens": data["total_tokens"],
+                "requests": data["requests"],
+            }
+
+        # Cache to file
+        try:
+            with open(RANKINGS_CACHE, "w") as f:
+                json.dump({
+                    "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    "source": "openrouter.ai/rankings",
+                    "entries": len(ranking_data),
+                    "rankings": rankings,
+                }, f, indent=2)
+            print(f"   Fetched {len(ranking_data)} entries, ranked {len(rankings)} models (cached to {RANKINGS_CACHE})")
+        except Exception:
+            print(f"   Fetched {len(ranking_data)} entries, ranked {len(rankings)} models")
+
+        return rankings
+
+    except Exception as e:
+        print(f"   Live fetch failed: {e}")
+        print("   Using fallback rankings")
+        return FALLBACK_RANKINGS
+
+
+def load_cached_rankings() -> dict:
+    """Load rankings from cache file."""
+    try:
+        with open(RANKINGS_CACHE, "r") as f:
+            data = json.load(f)
+        print(f"   Loaded cached rankings (updated: {data.get('updated', 'unknown')})")
+        return data.get("rankings", {})
+    except Exception:
+        return {}
+
+
+def get_rankings(live: bool = False) -> dict:
+    """Get rankings - either live fetch, cached, or fallback."""
+    if live:
+        return fetch_live_rankings()
+
+    # Try cache first
+    cached = load_cached_rankings()
+    if cached:
+        return cached
+
+    return FALLBACK_RANKINGS
 
 
 # ─── Data Fetching ───────────────────────────────────────────────────────────
@@ -172,14 +254,14 @@ def fetch_models() -> list[dict]:
     resp.raise_for_status()
     data = resp.json()
     models = data["data"]
-    print(f"   Found {len(models)} models\n")
+    print(f"   Found {len(models)} models")
     return models
 
 
 # ─── Model Analysis ──────────────────────────────────────────────────────────
 
-def analyze_model(model: dict) -> dict:
-    """Extract features from a model for scoring. All data from API fields only."""
+def analyze_model(model: dict, rankings: dict) -> dict:
+    """Extract features from a model for scoring."""
     mid = model["id"]
     params = set(model.get("supported_parameters") or [])
     arch = model.get("architecture") or {}
@@ -198,7 +280,13 @@ def analyze_model(model: dict) -> dict:
     is_free = prompt_price == 0 and completion_price == 0
     provider = mid.split("/")[0] if "/" in mid else "unknown"
 
-    ranking = RANKINGS.get(mid, {})
+    ranking = rankings.get(mid, {})
+    # Also try matching without version suffixes
+    if not ranking:
+        for key in rankings:
+            if mid.startswith(key) or key.startswith(mid):
+                ranking = rankings[key]
+                break
 
     return {
         "id": mid,
@@ -225,8 +313,8 @@ def analyze_model(model: dict) -> dict:
         "has_video": "video" in input_modalities,
         "has_audio": "audio" in input_modalities,
         "rank": ranking.get("rank", 999),
-        "tokens": ranking.get("tokens", "0"),
-        "growth": ranking.get("growth", "0%"),
+        "total_tokens": ranking.get("total_tokens", 0),
+        "requests": ranking.get("requests", 0),
         "created": model.get("created", 0),
         "knowledge_cutoff": model.get("knowledge_cutoff"),
         "expiration_date": model.get("expiration_date"),
@@ -234,23 +322,17 @@ def analyze_model(model: dict) -> dict:
 
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
-# All scoring uses only verifiable API data. No keyword matching, no subjective
-# description analysis, no name-based size estimation.
 
 def score_capability(analysis: dict, caps: dict) -> float:
     """Score model capabilities based on supported API parameters (0-100)."""
     if not caps:
         return 0
-
     score = 0.0
     params = analysis["params"]
     input_mods = set(analysis["input_modalities"])
-
     for param, weight in caps.items():
-        # Check both supported_parameters and input_modalities
         if param in params or param in input_mods:
             score += weight
-
     return min(score, 100)
 
 
@@ -259,18 +341,16 @@ def score_context(analysis: dict) -> float:
     ctx = analysis["context_length"]
     if ctx <= 0:
         return 0
-    # log10 scale: 4K=36, 32K=55, 128K=64, 1M=78, 10M=91, 100M=100
     return min(math.log10(ctx / 500) * 18, 100)
 
 
 def score_pricing(analysis: dict) -> float:
-    """Score pricing efficiency. Lower price = higher score (0-100)."""
+    """Score pricing efficiency (0-100)."""
     if analysis["is_free"]:
-        return 100  # Free is always best value
+        return 100
     price = analysis["prompt_price"]
     if price <= 0:
         return 100
-    # log scale: $0.10/1M=70, $1/1M=50, $5/1M=36, $15/1M=24, $75/1M=10
     per_million = price * 1_000_000
     if per_million <= 0:
         return 100
@@ -278,7 +358,7 @@ def score_pricing(analysis: dict) -> float:
 
 
 def score_popularity(analysis: dict) -> float:
-    """Score based on OpenRouter rankings data (0-100)."""
+    """Score based on OpenRouter rankings (0-100)."""
     rank = analysis["rank"]
     if rank == 1:
         return 100
@@ -292,17 +372,13 @@ def score_popularity(analysis: dict) -> float:
         return 45
     elif rank <= 50:
         return 25
-    else:
-        return 5  # Not in rankings = baseline, not zero
+    return 5
 
 
 def score_speed(analysis: dict) -> float:
-    """Estimate speed based on model characteristics (0-100).
-    Smaller context, fewer params = likely faster. This is a rough proxy."""
-    score = 50  # baseline
+    """Estimate speed from context size and model name (0-100)."""
+    score = 50
     ctx = analysis["context_length"]
-
-    # Smaller context often correlates with faster inference
     if 0 < ctx <= 8000:
         score += 25
     elif 0 < ctx <= 32000:
@@ -311,32 +387,18 @@ def score_speed(analysis: dict) -> float:
         score += 5
     elif ctx > 500000:
         score -= 10
-
-    # Models with "lite", "flash", "mini", "nano" in ID tend to be faster
     mid_lower = analysis["id"].lower()
     for kw in ["lite", "flash", "mini", "nano", "small", "turbo", "fast"]:
         if kw in mid_lower:
             score += 15
             break
-
-    # Free models often have rate-limited/slower endpoints
     if analysis["is_free"]:
         score -= 5
-
     return max(0, min(100, score))
 
 
 def score_model(analysis: dict, category: dict) -> float:
-    """Score a model for a category using weighted sub-scores (0-100).
-
-    Scoring is transparent and based on verifiable data only:
-    - capability: API supported_parameters flags
-    - context: context_length from API (log scale)
-    - pricing: prompt_price from API (log scale, inverted)
-    - popularity: OpenRouter rankings (capped at 15% influence)
-    - speed: heuristic from context size and model name patterns
-    """
-    # Hard filters
+    """Score a model for a category using weighted sub-scores (0-100)."""
     if category["only_free"] and not analysis["is_free"]:
         return 0
     if category["exclude_free"] and analysis["is_free"]:
@@ -344,32 +406,51 @@ def score_model(analysis: dict, category: dict) -> float:
     if category["require_multimodal"] and not analysis["is_multimodal"]:
         return 0
 
-    weights = category["weights"]
+    w = category["weights"]
     caps = category["caps"]
 
-    # Sub-scores (each 0-100)
     capability = score_capability(analysis, caps)
     context = score_context(analysis)
     pricing = score_pricing(analysis)
     popularity = score_popularity(analysis)
     speed = score_speed(analysis)
 
-    # Weighted total
     total = (
-        capability * weights.get("capability", 0)
-        + context * weights.get("context", 0)
-        + pricing * weights.get("pricing", 0)
-        + popularity * weights.get("popularity", 0)
-        + speed * weights.get("speed", 0)
+        capability * w.get("capability", 0)
+        + context * w.get("context", 0)
+        + pricing * w.get("pricing", 0)
+        + popularity * w.get("popularity", 0)
+        + speed * w.get("speed", 0)
     )
-
     return round(min(max(total, 0), 100), 1)
+
+
+# ─── Cost Calculator ─────────────────────────────────────────────────────────
+
+def calculate_cost(prompt_price: float, completion_price: float,
+                   input_tokens: int, output_tokens: int) -> float:
+    """Calculate cost for a given token usage."""
+    return (prompt_price * input_tokens) + (completion_price * output_tokens)
+
+
+def format_cost(cost: float) -> str:
+    """Format cost as readable string."""
+    if cost == 0:
+        return "$0.00"
+    elif cost < 0.01:
+        return f"${cost:.6f}"
+    elif cost < 1:
+        return f"${cost:.4f}"
+    elif cost < 100:
+        return f"${cost:.2f}"
+    else:
+        return f"${cost:.2f}"
 
 
 # ─── Formatting ──────────────────────────────────────────────────────────────
 
 def format_price(price: float) -> str:
-    """Format price per token into readable $/1M tokens."""
+    """Format price per 1M tokens."""
     if price == 0:
         return "FREE"
     per_million = price * 1_000_000
@@ -390,29 +471,97 @@ def format_context(ctx: int) -> str:
     return str(ctx)
 
 
+def format_tokens(tokens: int) -> str:
+    """Format token count."""
+    if tokens >= 1e12:
+        return f"{tokens/1e12:.2f}T"
+    elif tokens >= 1e9:
+        return f"{tokens/1e9:.2f}B"
+    elif tokens >= 1e6:
+        return f"{tokens/1e6:.1f}M"
+    elif tokens >= 1e3:
+        return f"{tokens/1e3:.1f}K"
+    return str(tokens)
+
+
 def format_expiration(exp: str) -> str:
-    """Format expiration date or return dash."""
-    if not exp:
-        return "-"
-    return exp[:10]
+    return exp[:10] if exp else "-"
 
 
-# ─── Output ──────────────────────────────────────────────────────────────────
+# ─── Filtering ───────────────────────────────────────────────────────────────
+
+def apply_filters(models: list[dict], args) -> list[dict]:
+    """Apply CLI filters to model list."""
+    # Exclude routing utilities
+    models = [m for m in models if m["id"] not in ("openrouter/auto", "openrouter/bodybuilder")]
+
+    # Expired filter
+    if not args.include_expired:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        models = [
+            m for m in models
+            if not m.get("expiration_date")
+            or datetime.fromisoformat(m["expiration_date"]).timestamp() > now_ts
+        ]
+
+    # Active filter
+    if args.active:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        six_months = 180 * 86400
+        rankings = get_rankings(live=False)
+        models = [
+            m for m in models
+            if m.get("created", 0) > now_ts - six_months
+            or m["id"] in rankings
+        ]
+
+    return models
+
+
+def apply_post_filters(analyses: list[dict], args) -> list[dict]:
+    """Apply post-analysis filters."""
+    if args.provider:
+        provider = args.provider.lower()
+        analyses = [a for a in analyses if a["provider"] == provider]
+
+    if args.max_price is not None:
+        max_p = args.max_price / 1_000_000  # Convert from $/1M to per-token
+        analyses = [a for a in analyses if a["is_free"] or a["prompt_price"] <= max_p]
+
+    if args.min_context:
+        analyses = [a for a in analyses if a["context_length"] >= args.min_context]
+
+    if args.has_tools:
+        analyses = [a for a in analyses if a["has_tools"]]
+
+    if args.has_reasoning:
+        analyses = [a for a in analyses if a["has_reasoning"]]
+
+    if args.free_only:
+        analyses = [a for a in analyses if a["is_free"]]
+
+    if args.paid_only:
+        analyses = [a for a in analyses if not a["is_free"]]
+
+    if args.multimodal_only:
+        analyses = [a for a in analyses if a["is_multimodal"]]
+
+    return analyses
+
+
+# ─── Output: Tables ──────────────────────────────────────────────────────────
 
 COL_MODEL = 48
-COL_W = 32
-
 
 def print_header():
     print()
     print("+" + "-" * 70 + "+")
-    print("|        OpenRouter Model Optimizer - LLM Analyzer                |")
-    print("|    Data-driven model ranking from OpenRouter API                |")
+    print("|  llm-radar - Data-driven LLM Ranking Tool for OpenRouter          |")
     print("+" + "-" * 70 + "+")
     print()
 
 
-def print_category_ranking(cat_key: str, cat: dict, scored: list[dict], top_n: int = 10):
+def print_category(cat_key, cat, scored, top_n=10):
     """Print ranked table for a category."""
     ranked = [s for s in scored if s["score"] > 0]
     ranked.sort(key=lambda x: x["score"], reverse=True)
@@ -421,7 +570,6 @@ def print_category_ranking(cat_key: str, cat: dict, scored: list[dict], top_n: i
     if not ranked:
         return
 
-    # Show weights for transparency
     w = cat["weights"]
     weight_str = " | ".join(f"{k}:{v:.0%}" for k, v in w.items() if v > 0)
 
@@ -435,35 +583,54 @@ def print_category_ranking(cat_key: str, cat: dict, scored: list[dict], top_n: i
 
     for i, s in enumerate(ranked, 1):
         a = s["analysis"]
-        model_display = a["id"][:COL_MODEL]
         price = format_price(a["prompt_price"])
         ctx = format_context(a["context_length"])
-        rank_display = f"#{a['rank']}" if a["rank"] < 999 else "-"
+        rank_d = f"#{a['rank']}" if a["rank"] < 999 else "-"
         exp = format_expiration(a.get("expiration_date"))
-
-        # Count how many of the relevant params this model supports
         caps = cat["caps"]
         param_count = sum(1 for p in caps if p in a["params"] or p in set(a["input_modalities"]))
         param_total = len(caps)
-        param_display = f"{param_count}/{param_total}" if param_total > 0 else "-"
-
-        print(
-            f"  {i:<3} {model_display:<{COL_MODEL}} {s['score']:>5.1f} {price:>12} {ctx:>7} {param_display:>7} {exp:>10} {rank_display:>4}"
-        )
-
+        param_d = f"{param_count}/{param_total}" if param_total > 0 else "-"
+        print(f"  {i:<3} {a['id'][:COL_MODEL]:<{COL_MODEL}} {s['score']:>5.1f} {price:>12} {ctx:>7} {param_d:>7} {exp:>10} {rank_d:>4}")
     print()
 
 
-def print_comparison(models_data: list[dict], model_ids: list[str]):
-    """Print side-by-side comparison of models."""
+# ─── Output: Cost Table ──────────────────────────────────────────────────────
+
+def print_cost_table(analyses, input_tokens, output_tokens, top_n=20):
+    """Print cost comparison table."""
+    print(f"\n{'-' * 106}")
+    print(f"  Cost Calculator: {format_tokens(input_tokens)} input + {format_tokens(output_tokens)} output tokens")
+    print(f"{'-' * 106}")
+    print(f"  {'#':<3} {'Model':<{COL_MODEL}} {'Input Cost':>12} {'Output Cost':>13} {'Total Cost':>12} {'Free':>4}")
+    print(f"  {'-'*3} {'-'*COL_MODEL} {'-'*12} {'-'*13} {'-'*12} {'-'*4}")
+
+    costs = []
+    for a in analyses:
+        ic = calculate_cost(a["prompt_price"], 0, input_tokens, 0)
+        oc = calculate_cost(0, a["completion_price"], 0, output_tokens)
+        total = ic + oc
+        costs.append((a, ic, oc, total))
+
+    costs.sort(key=lambda x: x[3])
+    costs = costs[:top_n]
+
+    for i, (a, ic, oc, total) in enumerate(costs, 1):
+        free = "Yes" if a["is_free"] else "-"
+        print(f"  {i:<3} {a['id'][:COL_MODEL]:<{COL_MODEL}} {format_cost(ic):>12} {format_cost(oc):>13} {format_cost(total):>12} {free:>4}")
+    print()
+
+
+# ─── Output: Comparison ──────────────────────────────────────────────────────
+
+def print_comparison(models_raw, model_ids, rankings):
+    """Side-by-side model comparison."""
+    COL_W = 32
     analyses = []
     for mid in model_ids:
-        found = [m for m in models_data if m["id"] == mid or m["id"].endswith(f"/{mid}")]
-        if not found:
-            # Fuzzy match
-            found = [m for m in models_data if mid.lower() in m["id"].lower()]
+        found = [m for m in models_raw if mid.lower() in m["id"].lower()]
         if found:
-            analyses.append(analyze_model(found[0]))
+            analyses.append(analyze_model(found[0], rankings))
         else:
             print(f"  Model '{mid}' not found")
 
@@ -471,9 +638,10 @@ def print_comparison(models_data: list[dict], model_ids: list[str]):
         print("  Need at least 2 valid models to compare")
         return
 
-    print(f"\n{'-' * (24 + COL_W * len(analyses))}")
+    width = 24 + COL_W * len(analyses)
+    print(f"\n{'-' * width}")
     print(f"  Model Comparison")
-    print(f"{'-' * (24 + COL_W * len(analyses))}")
+    print(f"{'-' * width}")
 
     header = f"  {'Feature':<24}"
     for a in analyses:
@@ -498,59 +666,53 @@ def print_comparison(models_data: list[dict], model_ids: list[str]):
         ("Input", lambda a: ", ".join(a["input_modalities"]) or "text"),
         ("Output", lambda a: ", ".join(a["output_modalities"]) or "text"),
         ("Ranking", lambda a: f"#{a['rank']}" if a["rank"] < 999 else "-"),
-        ("Tokens Used", lambda a: a["tokens"] or "-"),
-        ("Growth", lambda a: a["growth"] or "-"),
+        ("Total Tokens", lambda a: format_tokens(a["total_tokens"]) if a["total_tokens"] else "-"),
+        ("Requests", lambda a: f"{a['requests']:,}" if a["requests"] else "-"),
         ("Expires", lambda a: format_expiration(a.get("expiration_date"))),
     ]
 
     for label, getter in rows:
         row = f"  {label:<24}"
         for a in analyses:
-            val = str(getter(a))
-            row += f" {val:>{COL_W}}"
+            row += f" {str(getter(a)):>{COL_W}}"
         print(row)
 
-    # All supported parameters
+    # Supported parameters
     all_params = set()
     for a in analyses:
         all_params.update(a["params"])
-    all_params = sorted(all_params)
 
     print(f"\n  {'-' * 24}" + f" {'-' * COL_W}" * len(analyses))
     print(f"  {'Supported Parameters':<24}" + f" {'':>{COL_W}}" * len(analyses))
-
-    for p in all_params:
+    for p in sorted(all_params):
         row = f"    {p:<22}"
         for a in analyses:
-            has = "Yes" if p in a["params"] else "No"
-            row += f" {has:>{COL_W}}"
+            row += f" {'Yes' if p in a['params'] else 'No':>{COL_W}}"
         print(row)
 
     # Category scores
     print(f"\n  {'-' * 24}" + f" {'-' * COL_W}" * len(analyses))
     print(f"  {'Category Scores':<24}" + f" {'':>{COL_W}}" * len(analyses))
-
-    for cat_key, cat in CATEGORY_WEIGHTS.items():
+    for cat_key, cat in CATEGORIES.items():
         row = f"  {cat['label']:<24}"
         for a in analyses:
-            sc = score_model(a, cat)
-            row += f" {sc:>{COL_W}.1f}"
+            row += f" {score_model(a, cat):>{COL_W}.1f}"
         print(row)
 
     print()
 
 
-def print_show_model(models_data: list[dict], model_query: str):
-    """Show detailed info for a single model."""
-    query_lower = model_query.lower()
-    matches = [m for m in models_data if query_lower in m["id"].lower()]
+# ─── Output: Show Model ──────────────────────────────────────────────────────
 
+def print_show_model(models_raw, query, rankings):
+    """Detailed single model view."""
+    matches = [m for m in models_raw if query.lower() in m["id"].lower()]
     if not matches:
-        print(f"\n  No model found matching '{model_query}'")
+        print(f"\n  No model found matching '{query}'")
         return
 
     for m in matches:
-        a = analyze_model(m)
+        a = analyze_model(m, rankings)
         params_sorted = sorted(a["params"])
 
         print(f"\n{'=' * 72}")
@@ -580,9 +742,9 @@ def print_show_model(models_data: list[dict], model_query: str):
         print()
 
         if a["rank"] < 999:
-            print(f"  Ranking:          #{a['rank']} ({a['tokens']} tokens, {a['growth']})")
+            print(f"  Ranking:          #{a['rank']} ({format_tokens(a['total_tokens'])} tokens, {a['requests']:,} requests)")
         else:
-            print(f"  Ranking:          Not in top 10")
+            print(f"  Ranking:          Not in top 100")
         print()
 
         print(f"  Supported Parameters ({len(params_sorted)}):")
@@ -591,40 +753,38 @@ def print_show_model(models_data: list[dict], model_query: str):
         print()
 
         print(f"  Scores:")
-        for cat_key, cat in CATEGORY_WEIGHTS.items():
+        for cat_key, cat in CATEGORIES.items():
             sc = score_model(a, cat)
             if sc > 0:
-                bar_len = int(sc / 5)
-                bar = "#" * bar_len + "." * (20 - bar_len)
+                bar = "#" * int(sc / 5) + "." * (20 - int(sc / 5))
                 w = cat["weights"]
-                weight_str = ", ".join(f"{k}:{v:.0%}" for k, v in w.items() if v > 0)
-                print(f"    {cat['label']:<26} {sc:>5.1f}  [{bar}]  ({weight_str})")
+                ws = ", ".join(f"{k}:{v:.0%}" for k, v in w.items() if v > 0)
+                print(f"    {cat['label']:<26} {sc:>5.1f}  [{bar}]  ({ws})")
         print(f"{'=' * 72}\n")
 
 
-def print_optimize_claude(scored: list[dict]):
-    """Print recommendations for Claude Code model roles."""
+# ─── Output: Optimize Claude ─────────────────────────────────────────────────
+
+def print_optimize_claude(analyses, rankings):
+    """Claude Code model role optimizer."""
     print(f"\n{'=' * 72}")
     print(f"  Claude Code Model Optimizer")
     print(f"  Recommended models for each Claude Code role via OpenRouter")
     print(f"{'=' * 72}")
 
     for role_key, role in CLAUDE_CODE_ROLES.items():
-        role_scored = []
-        for s in scored:
-            a = s["analysis"]
-            total = 0
-            count = 0
-            for need in role["needs"]:
-                if need in CATEGORY_WEIGHTS:
-                    sc = score_model(a, CATEGORY_WEIGHTS[need])
-                    total += sc
-                    count += 1
+        scored = []
+        for a in analyses:
+            total = sum(
+                score_model(a, CATEGORIES[n])
+                for n in role["needs"] if n in CATEGORIES
+            )
+            count = sum(1 for n in role["needs"] if n in CATEGORIES)
             if count > 0:
-                role_scored.append({**s, "role_score": total / count})
+                scored.append({"analysis": a, "score": total / count})
 
-        role_scored.sort(key=lambda x: x["role_score"], reverse=True)
-        top = role_scored[:5]
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        top = scored[:5]
 
         print(f"\n  {role['label']}")
         print(f"  Env: export {role['env_var']}=\"<model-id>\"")
@@ -636,71 +796,59 @@ def print_optimize_claude(scored: list[dict]):
             a = s["analysis"]
             price = format_price(a["prompt_price"])
             free = "Yes" if a["is_free"] else "-"
-            print(
-                f"  {i:<3} {a['id'][:45]:<46} {s['role_score']:>6.1f} {price:>12} {free:>4}"
-            )
+            print(f"  {i:<3} {a['id'][:45]:<46} {s['score']:>6.1f} {price:>12} {free:>4}")
 
-        best = top[0]["analysis"]["id"] if top else None
-        if best:
-            print(f"\n  Recommended: {role['env_var']}=\"{best}\"")
+        if top:
+            print(f"\n  Recommended: {role['env_var']}=\"{top[0]['analysis']['id']}\"")
 
     print(f"\n{'=' * 72}")
     print("  To apply, add to your shell profile or run:")
     print()
-    best_overall = {}
     for role_key, role in CLAUDE_CODE_ROLES.items():
-        role_scored = []
-        for s in scored:
-            a = s["analysis"]
-            total = sum(
-                score_model(a, CATEGORY_WEIGHTS[need])
-                for need in role["needs"]
-                if need in CATEGORY_WEIGHTS
-            )
-            role_scored.append({**s, "role_score": total})
-        role_scored.sort(key=lambda x: x["role_score"], reverse=True)
-        if role_scored:
-            best_overall[role["env_var"]] = role_scored[0]["analysis"]["id"]
-
-    for env_var, model_id in best_overall.items():
-        print(f'  export {env_var}="{model_id}"')
+        scored = []
+        for a in analyses:
+            total = sum(score_model(a, CATEGORIES[n]) for n in role["needs"] if n in CATEGORIES)
+            scored.append({"analysis": a, "score": total})
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        if scored:
+            print(f'  export {role["env_var"]}="{scored[0]["analysis"]["id"]}"')
     print(f"{'=' * 72}\n")
 
 
-def print_json_output(all_rankings: dict):
-    """Print results as JSON."""
-    output = {}
-    for cat_key, data in all_rankings.items():
-        output[cat_key] = [
-            {
-                "rank": i + 1,
-                "model": s["analysis"]["id"],
-                "score": s["score"],
-                "prompt_price": s["analysis"]["prompt_price"],
-                "context_length": s["analysis"]["context_length"],
-                "is_free": s["analysis"]["is_free"],
-                "ranking": s["analysis"]["rank"],
-                "supported_params": sorted(s["analysis"]["params"]),
-            }
-            for i, s in enumerate(data)
-        ]
-    print(json.dumps(output, indent=2))
+# ─── Output: Search ──────────────────────────────────────────────────────────
+
+def print_search(analyses, query, top_n):
+    """Search models."""
+    q = query.lower()
+    results = [a for a in analyses if q in f"{a['id']} {a['name']} {a['description']} {a['provider']}".lower()]
+    results.sort(key=lambda x: x["rank"])
+
+    print(f"\n  Search results for '{query}' ({len(results)} matches)")
+    print(f"  {'-' * 90}")
+    print(f"  {'#':<3} {'Model':<46} {'Price':>12} {'Context':>7} {'Free':>4} {'Rank':>5}")
+    print(f"  {'-'*3} {'-'*46} {'-'*12} {'-'*7} {'-'*4} {'-'*5}")
+
+    for i, a in enumerate(results[:top_n], 1):
+        price = format_price(a["prompt_price"])
+        ctx = format_context(a["context_length"])
+        free = "Yes" if a["is_free"] else "-"
+        rank_d = f"#{a['rank']}" if a["rank"] < 999 else "-"
+        print(f"  {i:<3} {a['id'][:46]:<46} {price:>12} {ctx:>7} {free:>4} {rank_d:>5}")
+    print()
 
 
-def print_summary_stats(models: list[dict]):
-    """Print summary statistics."""
-    analyses = [analyze_model(m) for m in models]
+# ─── Output: Summary ─────────────────────────────────────────────────────────
 
+def print_summary(analyses):
+    """Ecosystem summary."""
     total = len(analyses)
     free = sum(1 for a in analyses if a["is_free"])
     with_tools = sum(1 for a in analyses if a["has_tools"])
     with_reasoning = sum(1 for a in analyses if a["has_reasoning"])
     multimodal = sum(1 for a in analyses if a["is_multimodal"])
     providers = len(set(a["provider"] for a in analyses))
-
     prices = [a["prompt_price"] for a in analyses if a["prompt_price"] > 0]
     avg_price = sum(prices) / len(prices) if prices else 0
-
     contexts = [a["context_length"] for a in analyses if a["context_length"] > 0]
     max_ctx = max(contexts) if contexts else 0
 
@@ -714,37 +862,43 @@ def print_summary_stats(models: list[dict]):
     print(f"  Multimodal:            {multimodal}")
     print(f"  Avg prompt price:      {format_price(avg_price)}")
     print(f"  Max context:           {format_context(max_ctx)}")
-    print(f"  Data source:           openrouter.ai/api/v1/models")
-    print(f"  Rankings source:       openrouter.ai/rankings")
     print()
 
 
-# ─── Search ──────────────────────────────────────────────────────────────────
+# ─── Output: Export ──────────────────────────────────────────────────────────
 
-def search_models(models: list[dict], query: str, top_n: int = 20):
-    """Search models by name, description, or provider."""
-    query_lower = query.lower()
-    results = []
-    for m in models:
-        a = analyze_model(m)
-        searchable = f"{a['id']} {a['name']} {a['description']} {a['provider']}".lower()
-        if query_lower in searchable:
-            results.append(a)
+def export_csv(all_rankings, analyses):
+    """Export rankings as CSV to stdout."""
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["Category", "Rank", "Model", "Score", "Price/1M", "Context", "Free", "Provider"])
+    for cat_key, scored in all_rankings.items():
+        for i, s in enumerate(scored, 1):
+            a = s["analysis"]
+            writer.writerow([
+                cat_key, i, a["id"], s["score"],
+                format_price(a["prompt_price"]),
+                a["context_length"],
+                a["is_free"],
+                a["provider"],
+            ])
 
-    results.sort(key=lambda x: x["rank"])
 
-    print(f"\n  Search results for '{query}' ({len(results)} matches)")
-    print(f"  {'-' * 84}")
-    print(f"  {'#':<3} {'Model':<44} {'Price':>12} {'Context':>7} {'Params':>7} {'Free':>4}")
-    print(f"  {'-'*3} {'-'*44} {'-'*12} {'-'*7} {'-'*7} {'-'*4}")
-
-    for i, a in enumerate(results[:top_n], 1):
-        price = format_price(a["prompt_price"])
-        ctx = format_context(a["context_length"])
-        free = "Yes" if a["is_free"] else "-"
-        param_count = len(a["params"])
-        print(f"  {i:<3} {a['id'][:44]:<44} {price:>12} {ctx:>7} {param_count:>7} {free:>4}")
-
+def export_markdown(all_rankings):
+    """Export rankings as Markdown to stdout."""
+    for cat_key, scored in all_rankings.items():
+        if not scored:
+            continue
+        cat = CATEGORIES[cat_key]
+        print(f"\n## {cat['label']}\n")
+        print(f"*{cat['description']}*\n")
+        print(f"| # | Model | Score | Price | Context | Free |")
+        print(f"|---|---|---|---|---|---|")
+        for i, s in enumerate(scored, 1):
+            a = s["analysis"]
+            price = format_price(a["prompt_price"])
+            ctx = format_context(a["context_length"])
+            free = "Yes" if a["is_free"] else "No"
+            print(f"| {i} | `{a['id']}` | {s['score']:.1f} | {price} | {ctx} | {free} |")
     print()
 
 
@@ -752,30 +906,12 @@ def search_models(models: list[dict], query: str, top_n: int = 20):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OpenRouter Model Optimizer - Data-driven LLM ranking",
+        description="llm-radar - Data-driven LLM ranking for OpenRouter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Scoring methodology:
-  All scores are based on verifiable API data only.
-  No subjective keyword matching or description analysis.
-
-  capability - Which API parameters the model supports (tools, reasoning, etc.)
-  context    - Context window size (log scale)
-  pricing    - Cost per token (log scale, inverted)
-  popularity - OpenRouter usage rankings (capped at 15-20% influence)
-  speed      - Heuristic from context size and model name patterns
-
-Examples:
-  python model-optimizer.py                   Full analysis
-  python model-optimizer.py --coding          Best for coding
-  python model-optimizer.py --free            Best free models
-  python model-optimizer.py --compare MODEL1 MODEL2
-  python model-optimizer.py --show MODEL      Detailed single model view
-  python model-optimizer.py --search QUERY    Search models
-  python model-optimizer.py --json            Machine-readable output
-  python model-optimizer.py --optimize-claude Best models for Claude Code
-        """,
+        epilog=__doc__,
     )
+
+    # Category flags
     parser.add_argument("--coding", action="store_true", help="Rank for coding")
     parser.add_argument("--reasoning", action="store_true", help="Rank for reasoning")
     parser.add_argument("--budget", action="store_true", help="Rank best value paid")
@@ -783,143 +919,158 @@ Examples:
     parser.add_argument("--agents", action="store_true", help="Rank for tool use/agents")
     parser.add_argument("--multimodal", action="store_true", help="Rank multimodal")
     parser.add_argument("--context", action="store_true", help="Rank by context length")
-    parser.add_argument("--compare", nargs=2, metavar=("MODEL1", "MODEL2"), help="Compare two models")
-    parser.add_argument("--show", metavar="MODEL", help="Show detailed info for a single model")
+
+    # View flags
+    parser.add_argument("--compare", nargs=2, metavar=("M1", "M2"), help="Compare two models")
+    parser.add_argument("--show", metavar="MODEL", help="Show detailed model info")
     parser.add_argument("--search", metavar="QUERY", help="Search models")
-    parser.add_argument("--top", type=int, default=10, help="Top N per category (default: 10)")
-    parser.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
     parser.add_argument("--optimize-claude", action="store_true", help="Optimize for Claude Code")
     parser.add_argument("--summary", action="store_true", help="Show ecosystem summary")
     parser.add_argument("--all", action="store_true", help="Show all categories (default)")
-    parser.add_argument("--active", action="store_true", help="Only active models (no expired, no routing utils)")
+    parser.add_argument("--top", type=int, default=10, help="Top N per category (default: 10)")
+
+    # Cost calculator
+    parser.add_argument("--cost", nargs=2, type=int, metavar=("INPUT", "OUTPUT"),
+                        help="Compare costs for N input + N output tokens")
+
+    # Filters
+    parser.add_argument("--provider", metavar="NAME", help="Filter by provider (e.g. anthropic)")
+    parser.add_argument("--max-price", type=float, metavar="$/1M", help="Max prompt price per 1M tokens")
+    parser.add_argument("--min-context", type=int, metavar="TOKENS", help="Min context length")
+    parser.add_argument("--has-tools", action="store_true", help="Only models with tool support")
+    parser.add_argument("--has-reasoning", action="store_true", help="Only models with reasoning")
+    parser.add_argument("--free-only", action="store_true", help="Only free models")
+    parser.add_argument("--paid-only", action="store_true", help="Only paid models")
+    parser.add_argument("--multimodal-only", action="store_true", help="Only multimodal models")
+    parser.add_argument("--active", action="store_true", help="Only active models (last 6 months)")
     parser.add_argument("--include-expired", action="store_true", help="Include expired models")
+
+    # Export
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Export as JSON")
+    parser.add_argument("--csv", action="store_true", dest="csv_output", help="Export as CSV")
+    parser.add_argument("--markdown", action="store_true", dest="md_output", help="Export as Markdown")
+
+    # Rankings
+    parser.add_argument("--update-rankings", action="store_true", help="Fetch live rankings from OpenRouter")
 
     args = parser.parse_args()
 
-    specific = any([
-        args.coding, args.reasoning, args.budget, args.free,
-        args.agents, args.multimodal, args.context, args.compare,
-        args.search, args.optimize_claude, args.summary, args.active, args.show,
-    ])
-    if not specific:
+    # Determine mode
+    category_flags = [args.coding, args.reasoning, args.budget, args.free,
+                      args.agents, args.multimodal, args.context]
+    view_flags = [args.compare, args.show, args.search, args.optimize_claude,
+                  args.summary, args.cost, args.update_rankings]
+    filter_flags = [args.provider, args.max_price, args.min_context,
+                    args.has_tools, args.has_reasoning, args.free_only,
+                    args.paid_only, args.multimodal_only, args.active]
+
+    specific = any(category_flags + view_flags + filter_flags)
+    # Default to all categories if no specific category/view selected
+    if not any(category_flags + view_flags):
         args.all = True
 
     print_header()
 
-    # Fetch models
-    models = fetch_models()
+    # Rankings
+    if args.update_rankings:
+        rankings = fetch_live_rankings()
+        if not args.all and not any([args.coding, args.reasoning, args.budget, args.free,
+                                      args.agents, args.multimodal, args.context,
+                                      args.compare, args.show, args.search,
+                                      args.optimize_claude, args.summary, args.cost]):
+            return
+    else:
+        rankings = get_rankings(live=False)
 
-    # Always exclude routing utilities
-    models = [m for m in models if m["id"] not in ("openrouter/auto", "openrouter/bodybuilder")]
+    # Fetch and filter models
+    models_raw = fetch_models()
+    models_raw = apply_filters(models_raw, args)
+    print(f"   Using {len(models_raw)} models for analysis\n")
 
-    # Filter expired models (unless --include-expired)
-    if not args.include_expired:
-        now_ts = datetime.now(timezone.utc).timestamp()
-        before = len(models)
-        models = [
-            m for m in models
-            if not m.get("expiration_date")
-            or datetime.fromisoformat(m["expiration_date"]).timestamp() > now_ts
-        ]
-        removed = before - len(models)
-        if removed:
-            print(f"   Filtered out {removed} expired model(s) (use --include-expired to show)")
+    analyses = [analyze_model(m, rankings) for m in models_raw]
+    analyses = apply_post_filters(analyses, args)
 
-    # Active-only filter: models created within last 6 months or in top rankings
-    if args.active:
-        now_ts = datetime.now(timezone.utc).timestamp()
-        six_months = 180 * 86400
-        before = len(models)
-        models = [
-            m for m in models
-            if m.get("created", 0) > now_ts - six_months
-            or m["id"] in RANKINGS
-        ]
-        removed = before - len(models)
-        print(f"   Active filter: kept {len(models)} models, removed {removed} older than 6 months")
+    if not analyses:
+        print("  No models match the given filters")
+        return
 
-    print(f"   Using {len(models)} models for analysis\n")
-    analyses = [analyze_model(m) for m in models]
+    # ── Mode dispatch ──
 
-    # Search mode
     if args.search:
-        search_models(models, args.search, args.top)
+        print_search(analyses, args.search, args.top)
         return
 
-    # Compare mode
     if args.compare:
-        print_comparison(models, args.compare)
+        print_comparison(models_raw, args.compare, rankings)
         return
 
-    # Show detailed model info
     if args.show:
-        print_show_model(models, args.show)
+        print_show_model(models_raw, args.show, rankings)
         return
 
-    # Summary
+    if args.cost:
+        input_t, output_t = args.cost
+        print_cost_table(analyses, input_t, output_t, args.top)
+        return
+
     if args.summary or args.all:
-        print_summary_stats(models)
+        print_summary(analyses)
 
-    # Optimize for Claude Code
     if args.optimize_claude:
-        scored_all = [{"analysis": a, "score": 0} for a in analyses]
-        print_optimize_claude(scored_all)
+        print_optimize_claude(analyses, rankings)
         return
 
-    # Determine which categories to show
+    # Category ranking
     cat_keys = []
     if args.all:
-        cat_keys = list(CATEGORY_WEIGHTS.keys())
+        cat_keys = list(CATEGORIES.keys())
     else:
-        if args.coding:
-            cat_keys.append("coding")
-        if args.reasoning:
-            cat_keys.append("reasoning")
-        if args.budget:
-            cat_keys.append("budget")
-        if args.free:
-            cat_keys.append("free")
-        if args.agents:
-            cat_keys.append("agents")
-        if args.multimodal:
-            cat_keys.append("multimodal")
-        if args.context:
-            cat_keys.append("context")
+        if args.coding: cat_keys.append("coding")
+        if args.reasoning: cat_keys.append("reasoning")
+        if args.budget: cat_keys.append("budget")
+        if args.free: cat_keys.append("free")
+        if args.agents: cat_keys.append("agents")
+        if args.multimodal: cat_keys.append("multimodal")
+        if args.context: cat_keys.append("context")
 
-    # Score and rank for each category
     all_rankings = {}
     for cat_key in cat_keys:
-        cat = CATEGORY_WEIGHTS[cat_key]
-        scored = []
-        for a in analyses:
-            sc = score_model(a, cat)
-            scored.append({"analysis": a, "score": sc})
-
+        cat = CATEGORIES[cat_key]
+        scored = [{"analysis": a, "score": score_model(a, cat)} for a in analyses]
         scored.sort(key=lambda x: x["score"], reverse=True)
-        top_scored = scored[:args.top]
-        all_rankings[cat_key] = top_scored
+        all_rankings[cat_key] = scored[:args.top]
 
-    if args.json_output:
-        print_json_output(all_rankings)
+    # Export or display
+    if args.csv_output:
+        export_csv(all_rankings, analyses)
+    elif args.md_output:
+        export_markdown(all_rankings)
+    elif args.json_output:
+        output = {}
+        for cat_key, data in all_rankings.items():
+            output[cat_key] = [
+                {"rank": i+1, "model": s["analysis"]["id"], "score": s["score"],
+                 "prompt_price": s["analysis"]["prompt_price"],
+                 "context_length": s["analysis"]["context_length"],
+                 "is_free": s["analysis"]["is_free"],
+                 "supported_params": sorted(s["analysis"]["params"])}
+                for i, s in enumerate(data)
+            ]
+        print(json.dumps(output, indent=2))
     else:
         for cat_key in cat_keys:
-            print_category_ranking(
-                cat_key, CATEGORY_WEIGHTS[cat_key], all_rankings[cat_key], args.top
-            )
+            print_category(cat_key, CATEGORIES[cat_key], all_rankings[cat_key], args.top)
 
-        # Top picks summary
         if args.all:
             print(f"\n{'=' * 72}")
             print(f"  Top Picks Summary")
             print(f"{'=' * 72}")
             for cat_key in cat_keys:
-                top = all_rankings[cat_key]
+                top = all_rankings.get(cat_key, [])
                 if top:
-                    best = top[0]
-                    cat = CATEGORY_WEIGHTS[cat_key]
-                    a = best["analysis"]
-                    free_tag = " (FREE)" if a["is_free"] else ""
-                    print(f"  {cat['label']:<28} -> {a['id']}{free_tag}")
+                    best = top[0]["analysis"]
+                    tag = " (FREE)" if best["is_free"] else ""
+                    print(f"  {CATEGORIES[cat_key]['label']:<28} -> {best['id']}{tag}")
             print(f"{'=' * 72}\n")
 
 

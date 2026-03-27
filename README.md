@@ -1,20 +1,17 @@
-# OpenRouter Model Optimizer
+# llm-radar
 
-Data-driven LLM ranking tool that analyzes and compares all models on [OpenRouter](https://openrouter.ai) using real API data. No subjective scoring — every score is based on verifiable model capabilities.
+Data-driven LLM ranking tool for [OpenRouter](https://openrouter.ai). Analyze, compare, and rank 340+ models using real API data. No subjective scoring.
 
-## How It Works
+## Features
 
-Scoring is **transparent and unbiased**. Each model is evaluated on 5 measurable dimensions:
-
-| Dimension | Source | What It Measures |
-|---|---|---|
-| **Capability** | `supported_parameters` API field | Tool use, reasoning, structured output, etc. |
-| **Context** | `context_length` API field | Context window size (log scale) |
-| **Pricing** | `pricing.prompt` API field | Cost efficiency (log scale, inverted) |
-| **Popularity** | openrouter.ai/rankings | Usage-based ranking (capped at 15-20% weight) |
-| **Speed** | Heuristic from context size + model name | Estimated inference speed |
-
-Each category defines **weights** for these dimensions (shown in output) and **capability caps** (which API params matter). No keyword matching on descriptions. No model-name-based size estimation.
+- **7 category rankings** — coding, reasoning, budget, free, agents, multimodal, context
+- **Live rankings** — fetches usage data directly from OpenRouter rankings page
+- **Cost calculator** — compare costs across all models for any token count
+- **Model comparison** — side-by-side with full parameter breakdown
+- **Detailed model view** — all capabilities, pricing, ranking, scores
+- **Filters** — by provider, price, context length, capabilities
+- **Export** — CSV, Markdown, JSON
+- **Claude Code optimizer** — best models for each role with export commands
 
 ## Install
 
@@ -25,75 +22,96 @@ pip install requests
 ## Usage
 
 ```bash
-# Full analysis across all categories
+# Full analysis
 python model-optimizer.py
 
-# Specific category
+# Category rankings
 python model-optimizer.py --coding
-python model-optimizer.py --reasoning
 python model-optimizer.py --free
 python model-optimizer.py --budget
-python model-optimizer.py --agents
-python model-optimizer.py --multimodal
-python model-optimizer.py --context
 
-# Compare two models side-by-side
-python model-optimizer.py --compare claude-opus-4.6 gpt-5-codex
+# Compare two models
+python model-optimizer.py --compare claude-opus-4.6 gemini-3-flash-preview
 
-# Detailed single model view
-python model-optimizer.py --show claude-opus-4.6
+# Detailed model view
+python model-optimizer.py --show gemini-3-flash-preview
 
-# Search models
-python model-optimizer.py --search gemini
+# Search
+python model-optimizer.py --search claude
 
-# Best models for Claude Code roles
-python model-optimizer.py --optimize-claude
+# Cost calculator (10K input + 5K output tokens)
+python model-optimizer.py --cost 10000 5000
 
-# Filter active models only (last 6 months + top ranked)
-python model-optimizer.py --active
+# Filters (combine any)
+python model-optimizer.py --provider anthropic
+python model-optimizer.py --max-price 1.00 --has-tools
+python model-optimizer.py --min-context 128000 --free-only
 
-# Include expired models
-python model-optimizer.py --include-expired
-
-# JSON output
+# Export
+python model-optimizer.py --csv --coding --top 20
+python model-optimizer.py --markdown --free --top 10
 python model-optimizer.py --json --coding --top 5
 
-# Limit results
-python model-optimizer.py --coding --top 20
+# Update live rankings
+python model-optimizer.py --update-rankings
+
+# Claude Code optimizer
+python model-optimizer.py --optimize-claude
 ```
 
-## Output Fields
+## Scoring
 
-| Field | Description |
+Every score is based on verifiable API data. No keyword matching.
+
+| Dimension | Source | Weight varies by category |
+|---|---|---|
+| Capability | `supported_parameters` API field | 25-55% |
+| Context | `context_length` API field (log scale) | 10-70% |
+| Pricing | `pricing.prompt` API field (log scale) | 0-35% |
+| Popularity | OpenRouter usage rankings (capped) | 10-20% |
+| Speed | Heuristic from context + model name | 5-15% |
+
+## All Flags
+
+| Flag | Description |
 |---|---|
-| `Score` | Weighted score (0-100) based on category weights |
-| `Price` | Prompt price per 1M tokens |
-| `Ctx` | Context window size |
-| `Params` | Supported API parameters / total relevant for category |
-| `Expires` | Model expiration date (if set by provider) |
-| `Pop` | OpenRouter popularity ranking (#N or -) |
-
-## Categories
-
-| Category | Capability | Context | Pricing | Popularity | Speed |
-|---|---|---|---|---|---|
-| Coding | 50% | 15% | 15% | 10% | 10% |
-| Reasoning | 55% | 20% | 10% | 10% | 5% |
-| Budget | 25% | 10% | 35% | 20% | 10% |
-| Free | 45% | 25% | 0% | 15% | 15% |
-| Agents | 55% | 15% | 10% | 10% | 10% |
-| Multimodal | 50% | 15% | 10% | 15% | 10% |
-| Context | 0% | 70% | 10% | 10% | 10% |
+| `--coding` | Rank for coding |
+| `--reasoning` | Rank for reasoning |
+| `--budget` | Best value paid models |
+| `--free` | Best free models |
+| `--agents` | Best for tool use/agents |
+| `--multimodal` | Best multimodal |
+| `--context` | Largest context windows |
+| `--compare M1 M2` | Compare two models |
+| `--show MODEL` | Detailed single model view |
+| `--search QUERY` | Search models |
+| `--cost IN OUT` | Cost calculator |
+| `--provider NAME` | Filter by provider |
+| `--max-price $/1M` | Max prompt price |
+| `--min-context N` | Min context length |
+| `--has-tools` | Only with tool support |
+| `--has-reasoning` | Only with reasoning |
+| `--free-only` | Only free models |
+| `--paid-only` | Only paid models |
+| `--multimodal-only` | Only multimodal |
+| `--active` | Only active (last 6 months) |
+| `--include-expired` | Include expired models |
+| `--top N` | Top N per category |
+| `--json` | Export as JSON |
+| `--csv` | Export as CSV |
+| `--markdown` | Export as Markdown |
+| `--update-rankings` | Fetch live rankings |
+| `--optimize-claude` | Best for Claude Code |
 
 ## Data Sources
 
-- **Models API**: `openrouter.ai/api/v1/models` (346 models, live)
-- **Rankings**: `openrouter.ai/rankings` (top 10 by weekly usage, hardcoded and updated manually)
+- **Models**: `openrouter.ai/api/v1/models` (346 models, live)
+- **Rankings**: `openrouter.ai/rankings` (live scraped, 100 models, cached)
 
 ## Requirements
 
 - Python 3.8+
-- `requests` library
+- `requests`
 
 ## License
 
